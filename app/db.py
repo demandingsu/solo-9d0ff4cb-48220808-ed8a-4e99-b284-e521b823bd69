@@ -30,13 +30,49 @@ CREATE TABLE IF NOT EXISTS segments (
     count          INTEGER NOT NULL CHECK (count >= 0)
 );
 
+CREATE TABLE IF NOT EXISTS certificates (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    inspection_id         INTEGER NOT NULL REFERENCES inspections(id) ON DELETE CASCADE,
+    qualified_lo          INTEGER NOT NULL CHECK (qualified_lo >= 0),
+    qualified_hi          INTEGER NOT NULL CHECK (qualified_hi > qualified_lo),
+    committed_count       INTEGER NOT NULL CHECK (committed_count >= 0),
+    issued_total_pieces   INTEGER NOT NULL CHECK (issued_total_pieces >= 0),
+    issued_min_count      INTEGER NOT NULL CHECK (issued_min_count >= 0),
+    status                TEXT NOT NULL DEFAULT 'active'
+                              CHECK (status IN ('active', 'revoked')),
+    issued_at             TEXT NOT NULL,
+    revoked_at            TEXT,
+    revoked_reason        TEXT,
+    revoked_total_pieces  INTEGER,
+    revoked_min_count     INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_reports_inspection
     ON count_reports(inspection_id);
 CREATE INDEX IF NOT EXISTS idx_segments_inspection
     ON segments(inspection_id);
 CREATE INDEX IF NOT EXISTS idx_segments_report
     ON segments(report_id);
+CREATE INDEX IF NOT EXISTS idx_certificates_inspection
+    ON certificates(inspection_id);
 """
+
+CERTIFICATE_NO_PREFIX = "CERT-"
+
+
+def format_certificate_no(certificate_id: int) -> str:
+    """证明编号：以主键确定性生成，撤销后编号不变。"""
+    return f"{CERTIFICATE_NO_PREFIX}{certificate_id:06d}"
+
+
+def parse_certificate_no(certificate_no: str) -> int | None:
+    """解析证明编号；格式不合法返回 ``None``（按不存在处理）。"""
+    if not certificate_no.startswith(CERTIFICATE_NO_PREFIX):
+        return None
+    digits = certificate_no[len(CERTIFICATE_NO_PREFIX) :]
+    if not digits.isdigit():
+        return None
+    return int(digits)
 
 
 def connect(path: str) -> sqlite3.Connection:
@@ -87,7 +123,13 @@ def get_inspection(connection: sqlite3.Connection, inspection_id: int) -> sqlite
                (SELECT COUNT(*) FROM count_reports r WHERE r.inspection_id = i.id)
                    AS report_count,
                (SELECT COUNT(*) FROM segments s WHERE s.inspection_id = i.id)
-                   AS segment_count
+                   AS segment_count,
+               (SELECT COUNT(*) FROM certificates c
+                  WHERE c.inspection_id = i.id AND c.status = 'active')
+                   AS active_certificate_count,
+               (SELECT COUNT(*) FROM certificates c
+                  WHERE c.inspection_id = i.id AND c.status = 'revoked')
+                   AS revoked_certificate_count
         FROM inspections i
         WHERE i.id = ?
         """,
@@ -102,7 +144,13 @@ def list_inspections(connection: sqlite3.Connection) -> list[sqlite3.Row]:
                (SELECT COUNT(*) FROM count_reports r WHERE r.inspection_id = i.id)
                    AS report_count,
                (SELECT COUNT(*) FROM segments s WHERE s.inspection_id = i.id)
-                   AS segment_count
+                   AS segment_count,
+               (SELECT COUNT(*) FROM certificates c
+                  WHERE c.inspection_id = i.id AND c.status = 'active')
+                   AS active_certificate_count,
+               (SELECT COUNT(*) FROM certificates c
+                  WHERE c.inspection_id = i.id AND c.status = 'revoked')
+                   AS revoked_certificate_count
         FROM inspections i
         ORDER BY i.id
         """
@@ -183,3 +231,86 @@ def get_reports(connection: sqlite3.Connection, inspection_id: int) -> list[dict
         }
         for report in reports
     ]
+
+
+def insert_certificate(
+    connection: sqlite3.Connection,
+    inspection_id: int,
+    qualified_lo: int,
+    qualified_hi: int,
+    committed_count: int,
+    issued_total_pieces: int,
+    issued_min_count: int,
+) -> int:
+    """写入一份有效证明，返回证明主键（证明编号由主键确定性生成）。"""
+    cursor = connection.execute(
+        """
+        INSERT INTO certificates (
+            inspection_id, qualified_lo, qualified_hi, committed_count,
+            issued_total_pieces, issued_min_count, status, issued_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+        """,
+        (
+            inspection_id,
+            qualified_lo,
+            qualified_hi,
+            committed_count,
+            issued_total_pieces,
+            issued_min_count,
+            now(),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def get_certificate(
+    connection: sqlite3.Connection, certificate_id: int
+) -> sqlite3.Row | None:
+    return connection.execute(
+        "SELECT * FROM certificates WHERE id = ?",
+        (certificate_id,),
+    ).fetchone()
+
+
+def list_certificates(
+    connection: sqlite3.Connection, inspection_id: int
+) -> list[sqlite3.Row]:
+    return connection.execute(
+        "SELECT * FROM certificates WHERE inspection_id = ? ORDER BY id",
+        (inspection_id,),
+    ).fetchall()
+
+
+def list_active_certificates(
+    connection: sqlite3.Connection, inspection_id: int
+) -> list[sqlite3.Row]:
+    return connection.execute(
+        "SELECT * FROM certificates WHERE inspection_id = ? AND status = 'active' "
+        "ORDER BY id",
+        (inspection_id,),
+    ).fetchall()
+
+
+def revoke_certificate(
+    connection: sqlite3.Connection,
+    certificate_id: int,
+    revoked_total_pieces: int,
+    revoked_min_count: int,
+    reason: str,
+) -> None:
+    """把一份证明置为终态 revoked，并冻结撤销时的总片数与下界快照。
+
+    只对仍有效的证明生效；已撤销证明不会被后续更正改写或恢复。
+    """
+    connection.execute(
+        """
+        UPDATE certificates
+           SET status = 'revoked',
+               revoked_at = ?,
+               revoked_reason = ?,
+               revoked_total_pieces = ?,
+               revoked_min_count = ?
+         WHERE id = ? AND status = 'active'
+        """,
+        (now(), reason, revoked_total_pieces, revoked_min_count, certificate_id),
+    )
